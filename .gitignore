@@ -1,5 +1,10 @@
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
-dist/
 build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+postmortem_*.md
+postmortem_*.html

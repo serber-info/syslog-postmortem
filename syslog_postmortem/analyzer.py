@@ -1,10 +1,11 @@
 """
 Pattern analysis, deduplication, cascade detection and contributing factor generation.
 """
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from datetime import datetime
+from typing import Dict, List, Optional
 
 from .collector import RawEntry, priority_to_severity
 from .patterns import match_patterns, Pattern
@@ -20,7 +21,8 @@ class Event:
     message: str
     source: str
     patterns: List[Pattern] = field(default_factory=list)
-    count: int = 1          # after deduplication
+    count: int = 1                              # after deduplication
+    last_timestamp: Optional[datetime] = None   # last repetition when count > 1
 
 
 # ── Analysis result ───────────────────────────────────────────────────────────
@@ -42,22 +44,29 @@ class AnalysisResult:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _deduplicate(events: List[Event], window_seconds: int = 60) -> List[Event]:
+# Standalone integers (PIDs, ports, counters) — but not IPv4 octets, versions or times.
+_VOLATILE_NUMBER = re.compile(r'(?<![\d.:])\d+(?![\d.:])')
+
+
+def _deduplicate(events: List[Event], window_seconds: int = 300) -> List[Event]:
     """
-    Merge identical messages that repeat within `window_seconds`.
-    Keeps the first occurrence with a count of how many times it appeared.
+    Merge identical messages from the same service while they keep repeating
+    (each repetition less than `window_seconds` after the previous one).
+    Keeps the first occurrence with a count and the time of the last repetition.
     """
     result: List[Event] = []
-    seen: Dict[str, Event] = {}
+    groups: Dict[tuple, Event] = {}
 
     for ev in events:
-        key = (ev.service, ev.message[:120])
-        if key in seen:
-            last = seen[key]
-            if (ev.timestamp - last.timestamp).total_seconds() <= window_seconds:
-                last.count += 1
+        key = (ev.service, _VOLATILE_NUMBER.sub('#', ev.message[:200]))
+        group = groups.get(key)
+        if group is not None:
+            last = group.last_timestamp or group.timestamp
+            if (ev.timestamp - last).total_seconds() <= window_seconds:
+                group.count += 1
+                group.last_timestamp = ev.timestamp
                 continue
-        seen[key] = ev
+        groups[key] = ev
         result.append(ev)
 
     return result
@@ -73,27 +82,37 @@ def _peak_minute(events: List[Event]) -> Optional[datetime]:
 
 def _detect_cascades(events: List[Event], window_seconds: int = 120) -> List[str]:
     """
-    Detect cascading failures: service A fails, service B fails shortly after.
-    Returns human-readable descriptions.
+    Detect cascading failures: service A has a critical event, service B starts
+    failing shortly after. One line per (A, B) pair, using A's first critical event.
     """
     cascades = []
+    seen_pairs = set()
     criticals = [e for e in events if e.severity == 'CRITICAL']
     errors = [e for e in events if e.severity == 'ERROR']
 
     for trigger in criticals:
         for follow in errors:
-            if follow.service == trigger.service:
+            pair = (trigger.service, follow.service)
+            if follow.service == trigger.service or pair in seen_pairs:
                 continue
             delta = (follow.timestamp - trigger.timestamp).total_seconds()
             if 0 < delta <= window_seconds:
+                seen_pairs.add(pair)
                 cascades.append(
-                    f"**{follow.service}** errors began "
-                    f"**{int(delta)}s** after first **{trigger.service}** critical event "
+                    f"**Cascading failure**: `{follow.service}` errors began "
+                    f"**{int(delta)}s** after the first `{trigger.service}` critical event "
                     f"({trigger.timestamp.strftime('%H:%M:%S')})"
                 )
-                break  # one cascade per trigger service pair
-
     return cascades
+
+
+_SEV_RANK = {'CRITICAL': 0, 'ERROR': 1, 'WARNING': 2, 'INFO': 3, 'DEBUG': 4}
+
+
+def service_matches(service: str, wanted: List[str]) -> bool:
+    """'postgresql' matches 'postgresql', 'postgresql@14-main' and 'postgresql.service'."""
+    s = service.lower()
+    return any(s == w or s.startswith((w + '@', w + '.', w + '-')) for w in wanted)
 
 
 # ── Main analyser ─────────────────────────────────────────────────────────────
@@ -103,15 +122,15 @@ def analyze(raw: List[RawEntry], services_filter: List[str] = None) -> AnalysisR
 
     # 1. Normalise RawEntry → Event and run pattern matching
     events: List[Event] = []
+    wanted = [s.lower() for s in services_filter or []]
     for r in raw:
-        if services_filter and r.service.lower() not in [s.lower() for s in services_filter]:
+        if wanted and not service_matches(r.service, wanted):
             continue
         severity = priority_to_severity(r.priority)
         matched = match_patterns(r.message)
-        # Upgrade severity based on pattern if stricter
-        sev_rank = {'CRITICAL': 0, 'ERROR': 1, 'WARNING': 2, 'INFO': 3, 'DEBUG': 4}
+        # Upgrade severity when a known pattern is more serious than the log priority
         for p in matched:
-            if sev_rank.get(p.severity, 4) < sev_rank.get(severity, 4):
+            if _SEV_RANK.get(p.severity, 4) < _SEV_RANK.get(severity, 4):
                 severity = p.severity
         events.append(Event(
             timestamp=r.timestamp,
@@ -156,10 +175,10 @@ def analyze(raw: List[RawEntry], services_filter: List[str] = None) -> AnalysisR
     factors: List[str] = []
 
     # Restart loops
-    restart_counts = Counter(
-        e.service for e in timeline
-        if any(p.name == 'service_restart' for p in e.patterns)
-    )
+    restart_counts: Counter = Counter()
+    for e in timeline:
+        if any(p.name == 'service_restart' for p in e.patterns):
+            restart_counts[e.service] += e.count
     for svc, cnt in restart_counts.most_common():
         factors.append(
             f"**Service instability**: `{svc}` triggered restart-loop detection **{cnt} time(s)**"

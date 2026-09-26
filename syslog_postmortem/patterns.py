@@ -32,7 +32,8 @@ PATTERNS = [
     ),
     Pattern(
         name='kernel_oops',
-        regex=re.compile(r'kernel: bug|kernel: oops|kernel: warning.*call trace|segfault|general protection', re.I),
+        # Journald strips the "kernel:" prefix, so match the message itself.
+        regex=re.compile(r'\bBUG: |\bOops[:\s]|\bcall trace\b|segfault at|general protection|kernel panic', re.I),
         severity='CRITICAL',
         label='Kernel Error',
         action_hint='Review kernel logs; consider rebooting if system is unstable',
@@ -95,7 +96,8 @@ PATTERNS = [
     ),
     Pattern(
         name='high_load',
-        regex=re.compile(r'load average.*\b([5-9]\d|\d{2,})\b|cpu.*throttl|system.*overload', re.I),
+        # A 1-minute load average of 10 or more (e.g. "load average: 12.40, 8.10, 3.02").
+        regex=re.compile(r'load average:?\s*(?:[1-9]\d+|\d{3,})(?:\.\d+)?\b|cpu.*throttl|system.*overload', re.I),
         severity='WARNING',
         label='High System Load',
         action_hint='Identify CPU-intensive processes; consider horizontal scaling',

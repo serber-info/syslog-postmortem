@@ -1,32 +1,51 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "syslog-postmortem"
-version = "1.0.0"
-description = "Generate structured postmortem drafts from journalctl, syslog, auth.log and dmesg"
+dynamic = ["version"]
+description = "Generate structured postmortem drafts from journalctl, syslog, auth.log and kern.log"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Sergio Berruetta" }]
-requires-python = ">=3.8"
-dependencies = ["shellcolorize"]
+requires-python = ">=3.9"
+dependencies = ["shellcolorize>=1.1.0"]
+keywords = ["postmortem", "incident", "sre", "journalctl", "syslog", "logs", "sysadmin"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX :: Linux",
     "Environment :: Console",
+    "Intended Audience :: System Administrators",
     "Topic :: System :: Logging",
     "Topic :: System :: Systems Administration",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.4"]
 
 [project.urls]
 Homepage     = "https://github.com/serber-info/syslog-postmortem"
 "Bug Tracker" = "https://github.com/serber-info/syslog-postmortem/issues"
 "Source Code" = "https://github.com/serber-info/syslog-postmortem"
+Changelog    = "https://github.com/serber-info/syslog-postmortem/blob/main/CHANGELOG.md"
 
 [project.scripts]
 postmortem = "syslog_postmortem.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["syslog_postmortem*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "syslog_postmortem.__version__" }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]

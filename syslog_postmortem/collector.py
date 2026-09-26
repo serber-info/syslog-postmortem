@@ -1,14 +1,14 @@
 """
-Log collection from journalctl (primary) and /var/log files (fallback/supplement).
+Log collection from journalctl (primary) and /var/log files (supplement).
 """
 import json
+import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
-
+from typing import List, Optional, Tuple
 
 # ── Data model ────────────────────────────────────────────────────────────────
 
@@ -18,10 +18,15 @@ class RawEntry:
     service: str
     priority: int       # syslog priority 0-7 (0=emerg, 7=debug)
     message: str
-    source: str         # 'journald' | 'syslog' | 'auth' | 'dmesg'
+    source: str         # 'journald' | 'syslog' | 'auth' | 'kernel'
     hostname: str = ''
     pid: Optional[int] = None
 
+
+@dataclass
+class CollectionResult:
+    entries: List[RawEntry]
+    warnings: List[str]
 
 # ── Priority helpers ──────────────────────────────────────────────────────────
 
@@ -32,197 +37,204 @@ PRIORITY_MAP = {
     5: 'INFO', 6: 'INFO', 7: 'DEBUG',
 }
 
+_PRIORITY_NAMES = {'emerg': 0, 'alert': 1, 'crit': 2, 'err': 3, 'warning': 4,
+                   'notice': 5, 'info': 6, 'debug': 7}
+
 
 def priority_to_severity(p: int) -> str:
     return PRIORITY_MAP.get(p, 'INFO')
 
 
+def max_priority(spec: str) -> int:
+    """Highest (least severe) syslog priority allowed by a journalctl spec: '0..4' → 4, 'err' → 3."""
+    last = spec.split('..')[-1].strip().lower()
+    if last.isdigit():
+        return int(last)
+    return _PRIORITY_NAMES.get(last, 4)
+
+
+# Plain-text log files carry no priority: infer it from the wording.
+_KEYWORD_PRIORITY = [
+    (re.compile(r'\b(panic|emerg(ency)?|fatal|critical|crit|oom|out of memory|kernel bug|oops)\b', re.I), 2),
+    (re.compile(r'\b(err(or)?s?|fail(ed|ure|s)?|refused|denied|segfault|abort(ed)?|unable|cannot)\b', re.I), 3),
+    (re.compile(r'\b(warn(ing)?s?|timed? ?out|retry(ing)?|deprecated|invalid user)\b', re.I), 4),
+]
+
+
+def infer_priority(message: str) -> int:
+    for regex, prio in _KEYWORD_PRIORITY:
+        if regex.search(message):
+            return prio
+    return 6
+
 # ── journalctl ────────────────────────────────────────────────────────────────
 
-def collect_journalctl(since: str, until: str,
-                       units: List[str] = None,
-                       priorities: str = '0..4') -> List[RawEntry]:
-    """
-    Collect entries from systemd journal.
-    `priorities` controls syslog priority filter (default: emerg..warning).
-    Returns an empty list if journalctl is unavailable.
-    """
-    cmd = [
-        'journalctl',
-        '--since', since,
-        '--until', until,
-        '--output', 'json',
-        '--no-pager',
-        '--priority', priorities,
-    ]
-    if units:
-        for u in units:
-            cmd += ['-u', u]
+def _journal_readable() -> bool:
+    """Root and members of adm/systemd-journal/wheel can read the whole system journal."""
+    if os.geteuid() == 0:
+        return True
+    try:
+        import grp
+        names = {grp.getgrgid(g).gr_name for g in os.getgroups()}
+    except (ImportError, KeyError):
+        return False
+    return bool(names & {'adm', 'systemd-journal', 'wheel'})
+
+
+def collect_journalctl(since: datetime, until: datetime, units: Optional[List[str]] = None,
+                       priorities: str = '0..4', timeout: int = 120) -> Tuple[List[RawEntry], List[str]]:
+    """Entries from the systemd journal. Returns (entries, warnings)."""
+    warnings: List[str] = []
+    cmd = ['journalctl', '--since', since.strftime('%Y-%m-%d %H:%M:%S'),
+           '--until', until.strftime('%Y-%m-%d %H:%M:%S'),
+           '--output', 'json', '--no-pager', '--quiet', '--priority', priorities]
+    for u in units or []:
+        cmd += ['-u', u if '.' in u or '*' in u else f'{u}*']
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return [], ['journalctl not found — only /var/log files were analysed']
+    except subprocess.TimeoutExpired:
+        return [], [f'journalctl did not finish within {timeout}s — try a shorter window or --services']
+
+    if not _journal_readable():
+        warnings.append('Not root and not in the adm/systemd-journal group: '
+                        'only your own journal entries are visible (run with sudo)')
 
     entries = []
     for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
+            ts = datetime.fromtimestamp(int(obj['__REALTIME_TIMESTAMP']) / 1_000_000)
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
             continue
 
-        ts_us = int(obj.get('__REALTIME_TIMESTAMP', 0))
-        if not ts_us:
-            continue
-
-        ts = datetime.fromtimestamp(ts_us / 1_000_000)
-        service = (obj.get('_SYSTEMD_UNIT') or
-                   obj.get('SYSLOG_IDENTIFIER') or
-                   obj.get('_COMM') or 'unknown')
+        # systemd (PID 1) logs about other units with UNIT=…; attribute those messages to that unit.
+        service = (obj.get('UNIT') or obj.get('USER_UNIT') or obj.get('_SYSTEMD_UNIT')
+                   or obj.get('SYSLOG_IDENTIFIER') or obj.get('_COMM') or 'unknown')
         service = service.removesuffix('.service')
+        if obj.get('_TRANSPORT') == 'kernel':
+            service = 'kernel'
 
-        priority = int(obj.get('PRIORITY', 6))
         message = obj.get('MESSAGE', '')
-        if isinstance(message, list):
-            message = ' '.join(str(b) for b in message)
+        if isinstance(message, list):   # binary payloads come as byte arrays
+            message = bytes(b for b in message if isinstance(b, int) and 0 <= b < 256).decode('utf-8', 'replace')
 
-        pid_raw = obj.get('_PID')
-        pid = int(pid_raw) if pid_raw and str(pid_raw).isdigit() else None
+        try:
+            priority = int(obj.get('PRIORITY', 6))
+        except (TypeError, ValueError):
+            priority = 6
+        pid = obj.get('_PID')
 
         entries.append(RawEntry(
-            timestamp=ts,
-            service=service,
-            priority=priority,
-            message=str(message).strip(),
-            source='journald',
-            hostname=obj.get('_HOSTNAME', ''),
-            pid=pid,
+            timestamp=ts, service=service, priority=priority, message=str(message).strip(),
+            source='journald', hostname=obj.get('_HOSTNAME', ''),
+            pid=int(pid) if str(pid).isdigit() else None,
         ))
-
-    return entries
-
+    return entries, warnings
 
 # ── /var/log file parsers ─────────────────────────────────────────────────────
 
-# Standard syslog line: "May 10 14:03:22 host service[pid]: message"
-_SYSLOG_RE = re.compile(
-    r'^(\w{3}\s+\d+\s[\d:]+)\s+(\S+)\s+(\S+?)(?:\[(\d+)\])?:\s+(.*)'
-)
+# Traditional syslog: "May 10 14:03:22 host service[pid]: message"
+_SYSLOG_RE = re.compile(r'^(\w{3}\s+\d+\s[\d:]+)\s+(\S+)\s+([^\s\[:]+)(?:\[(\d+)\])?:\s*(.*)')
 
-# ISO timestamp variant: "2026-05-10T14:03:22.123456+00:00 host service: msg"
-_ISO_SYSLOG_RE = re.compile(
-    r'^(\d{4}-\d{2}-\d{2}T[\d:.+]+)\s+(\S+)\s+(\S+?)(?:\[(\d+)\])?:\s+(.*)'
-)
+# RFC 3339 syslog (rsyslog high-precision): "2026-05-10T14:03:22.123456+02:00 host service[pid]: msg"
+_ISO_SYSLOG_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}T\S+)\s+(\S+)\s+([^\s\[:]+)(?:\[(\d+)\])?:\s*(.*)')
 
 
-def _parse_syslog_ts(ts_str: str, year: int) -> Optional[datetime]:
-    ts_str = ts_str.strip()
-    for fmt in ('%b %d %H:%M:%S', '%b  %d %H:%M:%S'):
-        try:
-            dt = datetime.strptime(ts_str, fmt).replace(year=year)
-            return dt
+def _parse_syslog_ts(ts_str: str, since: datetime, until: datetime) -> Optional[datetime]:
+    """Syslog timestamps have no year: pick the year that falls inside or closest to the window."""
+    ts_str = ' '.join(ts_str.split())
+    candidates = []
+    for year in sorted({since.year, until.year}):
+        try:   # parse with an explicit year (also valid for Feb 29 in leap years)
+            candidates.append(datetime.strptime(f'{year} {ts_str}', '%Y %b %d %H:%M:%S'))
         except ValueError:
             continue
-    return None
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: 0 if since <= c <= until else min(abs((c - since).total_seconds()),
+                                                                          abs((c - until).total_seconds())))
 
 
 def _parse_iso_ts(ts_str: str) -> Optional[datetime]:
-    ts_str = re.sub(r'([+-]\d{2}:\d{2})$', '', ts_str)
-    for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
-        try:
-            return datetime.strptime(ts_str, fmt)
-        except ValueError:
-            continue
-    return None
+    """RFC 3339 timestamp → naive local time (offsets are converted, not dropped)."""
+    try:
+        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
 
 
-def collect_logfile(path: str, since: datetime, until: datetime,
-                    source_label: str = 'syslog',
-                    default_priority: int = 3) -> List[RawEntry]:
-    """Parse a /var/log-style file and return entries in [since, until]."""
+def collect_logfile(path: str, since: datetime, until: datetime, source_label: str = 'syslog',
+                    max_prio: int = 4) -> List[RawEntry]:
+    """Parse a /var/log-style file and return entries in [since, until] at or above max_prio."""
     p = Path(path)
-    if not p.exists() or not p.is_file():
+    if not p.is_file():
         return []
-
     entries = []
-    year = since.year
-
     try:
         with open(p, 'r', errors='replace') as fh:
             for line in fh:
                 line = line.rstrip('\n')
-                ts = None
-                service = source_label
-                message = line
-                pid = None
-                hostname = ''
-
                 m = _SYSLOG_RE.match(line)
                 if m:
-                    ts = _parse_syslog_ts(m.group(1), year)
-                    hostname = m.group(2)
-                    service = m.group(3)
-                    pid = int(m.group(4)) if m.group(4) else None
-                    message = m.group(5)
+                    ts = _parse_syslog_ts(m.group(1), since, until)
                 else:
                     m = _ISO_SYSLOG_RE.match(line)
-                    if m:
-                        ts = _parse_iso_ts(m.group(1))
-                        hostname = m.group(2)
-                        service = m.group(3)
-                        pid = int(m.group(4)) if m.group(4) else None
-                        message = m.group(5)
-
+                    ts = _parse_iso_ts(m.group(1)) if m else None
                 if ts is None or not (since <= ts <= until):
                     continue
-
+                message = m.group(5).strip()
+                priority = infer_priority(message)
+                if priority > max_prio:
+                    continue
                 entries.append(RawEntry(
-                    timestamp=ts,
-                    service=service,
-                    priority=default_priority,
-                    message=message.strip(),
-                    source=source_label,
-                    hostname=hostname,
-                    pid=pid,
+                    timestamp=ts, service=m.group(3), priority=priority, message=message,
+                    source=source_label, hostname=m.group(2),
+                    pid=int(m.group(4)) if m.group(4) else None,
                 ))
-    except PermissionError:
+    except OSError:
         pass
-
     return entries
 
 
+LOG_FILES = [
+    ('/var/log/syslog',   'syslog'),
+    ('/var/log/messages', 'syslog'),
+    ('/var/log/auth.log', 'auth'),
+    ('/var/log/secure',   'auth'),
+    ('/var/log/kern.log', 'kernel'),
+]
+
 # ── Main collection entry point ───────────────────────────────────────────────
 
-def collect_all(since: str, until: str,
-                units: List[str] = None,
-                include_files: bool = True,
-                priorities: str = '0..4') -> List[RawEntry]:
+def collect_all(since: datetime, until: datetime, units: Optional[List[str]] = None,
+                include_files: bool = True, priorities: str = '0..4') -> CollectionResult:
     """
-    Collect from journalctl and optionally from /var/log files.
-    Returns a merged, time-sorted list of RawEntry.
+    Collect from journalctl and optionally from /var/log files (plus their '.1' rotation).
+    File lines already present in the journal are skipped. Returns entries sorted by time.
     """
-    since_dt = datetime.strptime(since, '%Y-%m-%d %H:%M')
-    until_dt = datetime.strptime(until, '%Y-%m-%d %H:%M')
-
-    entries = collect_journalctl(since, until, units, priorities)
+    entries, warnings = collect_journalctl(since, until, units, priorities)
 
     if include_files:
-        log_files = [
-            ('/var/log/syslog',    'syslog',   4),
-            ('/var/log/messages',  'syslog',   4),
-            ('/var/log/auth.log',  'auth',     4),
-            ('/var/log/secure',    'auth',     4),
-            ('/var/log/kern.log',  'kernel',   3),
-            ('/var/log/dmesg',     'kernel',   3),
-        ]
-        seen_msgs: set = {e.message for e in entries}
-        for path, label, prio in log_files:
-            for entry in collect_logfile(path, since_dt, until_dt, label, prio):
-                if entry.message not in seen_msgs:
-                    entries.append(entry)
-                    seen_msgs.add(entry.message)
+        seen = {(e.timestamp.replace(microsecond=0), e.message) for e in entries}
+        unreadable = []
+        prio = max_priority(priorities)
+        for path, label in LOG_FILES:
+            for candidate in (path, f'{path}.1'):
+                if Path(candidate).is_file() and not os.access(candidate, os.R_OK):
+                    unreadable.append(candidate)
+                    continue
+                for entry in collect_logfile(candidate, since, until, label, prio):
+                    key = (entry.timestamp.replace(microsecond=0), entry.message)
+                    if key not in seen:
+                        seen.add(key)
+                        entries.append(entry)
+        if unreadable:
+            warnings.append(f"Cannot read {', '.join(unreadable)} (run with sudo)")
 
-    return sorted(entries, key=lambda e: e.timestamp)
+    return CollectionResult(entries=sorted(entries, key=lambda e: e.timestamp), warnings=warnings)

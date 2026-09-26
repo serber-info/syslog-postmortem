@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Test against the latest shellcolorize (sibling project).
+      - run: pip install "shellcolorize @ git+https://github.com/serber-info/shell-colorize.git"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest -q
+

@@ -1,12 +1,18 @@
 """
 Render an AnalysisResult to Markdown or HTML.
+
+Log content is untrusted (an SSH login attempt can put arbitrary text in auth.log),
+so every piece of log text is escaped: backslash escapes in Markdown, and the HTML
+converter escapes everything before applying the small Markdown subset we emit.
 """
+import html
+import re
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
+from . import __version__
 from .analyzer import AnalysisResult, Event
-
-VERSION = "1.0.0"
+from .patterns import PATTERNS
 
 _SEV_ICON = {
     'CRITICAL': '⛔',
@@ -15,9 +21,25 @@ _SEV_ICON = {
     'INFO':     'ℹ️',
     'DEBUG':    '🔵',
 }
-
 _SEV_ORDER = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
+_TIMELINE_LIMIT = 50
 
+# ── Escaping ──────────────────────────────────────────────────────────────────
+
+_MD_SPECIAL = re.compile(r'([\\`*_\[\]<>|#~])')
+
+
+def md_text(s: str, limit: Optional[int] = None) -> str:
+    """Untrusted text → Markdown that renders literally (one line, no HTML, no formatting)."""
+    s = ' '.join(str(s).split())
+    if limit and len(s) > limit:
+        s = s[:limit - 1] + '…'
+    return _MD_SPECIAL.sub(r'\\\1', s)
+
+
+def md_code(s: str) -> str:
+    """Untrusted identifier (service name) → inline code span."""
+    return '`' + str(s).replace('`', "'").replace('|', '\\|') + '`'
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -25,24 +47,21 @@ def _ts(dt: datetime) -> str:
     return dt.strftime('%H:%M:%S')
 
 
-def _md_escape(s: str) -> str:
-    return s.replace('|', '\\|').replace('`', "'")
+def _duration(since: datetime, until: datetime) -> str:
+    h, rem = divmod(int((until - since).total_seconds()), 3600)
+    m = rem // 60
+    parts = [f"{h}h"] if h else []
+    if m:
+        parts.append(f"{m}m")
+    return ' '.join(parts) or '< 1m'
 
 
-def _duration(since: str, until: str) -> str:
-    fmt = '%Y-%m-%d %H:%M'
-    try:
-        delta = datetime.strptime(until, fmt) - datetime.strptime(since, fmt)
-        h, rem = divmod(int(delta.total_seconds()), 3600)
-        m = rem // 60
-        parts = []
-        if h:
-            parts.append(f"{h}h")
-        if m:
-            parts.append(f"{m}m")
-        return ' '.join(parts) or '< 1m'
-    except ValueError:
-        return 'unknown'
+def _repeat(ev: Event) -> str:
+    """' _(×12, until 10:55:02)_' for repeated events."""
+    if ev.count <= 1:
+        return ''
+    until = f", until {_ts(ev.last_timestamp)}" if ev.last_timestamp else ''
+    return f" _(×{ev.count}{until})_"
 
 
 def _overall_severity(result: AnalysisResult) -> str:
@@ -55,230 +74,225 @@ def _overall_severity(result: AnalysisResult) -> str:
     return 'Low'
 
 
+def _timeline_events(result: AnalysisResult) -> List[Event]:
+    """Warnings and above; when there are too many, keep the most severe, in time order."""
+    events = [e for e in result.timeline if e.severity in ('CRITICAL', 'ERROR', 'WARNING')]
+    if len(events) <= _TIMELINE_LIMIT:
+        return events
+    rank = {s: i for i, s in enumerate(_SEV_ORDER)}
+    keep = sorted(events, key=lambda e: (rank[e.severity], e.timestamp))[:_TIMELINE_LIMIT]
+    return sorted(keep, key=lambda e: e.timestamp)
+
 # ── Markdown renderer ─────────────────────────────────────────────────────────
 
-def render_markdown(result: AnalysisResult, title: str,
-                    since: str, until: str,
+def render_markdown(result: AnalysisResult, title: str, since: datetime, until: datetime,
                     services: Optional[list] = None) -> str:
-    lines = []
-    date_str = since.split()[0]
-    duration = _duration(since, until)
-    severity_label = _overall_severity(result)
-    affected_str = ', '.join(f'`{s}`' for s in result.services_affected) or '_none detected_'
-
-    # ── Header ─────────────────────────────────────────────────────────────────
-    lines += [
-        f"# Postmortem: {title}",
+    fmt = '%Y-%m-%d %H:%M'
+    affected = ', '.join(md_code(s) for s in result.services_affected) or '_none detected_'
+    lines = [
+        f"# Postmortem: {md_text(title)}",
         "",
-        f"| | |",
-        f"|---|---|",
-        f"| **Date** | {date_str} |",
-        f"| **Window** | {since} → {until} |",
-        f"| **Duration** | {duration} |",
-        f"| **Severity** | {severity_label} |",
-        f"| **Status** | Draft |",
-        f"| **Services affected** | {affected_str} |",
+        "| | |",
+        "|---|---|",
+        f"| **Date** | {since.strftime('%Y-%m-%d')} |",
+        f"| **Window** | {since.strftime(fmt)} → {until.strftime(fmt)} |",
+        f"| **Duration** | {_duration(since, until)} |",
+        f"| **Severity** | {_overall_severity(result)} |",
+        "| **Status** | Draft |",
+        f"| **Services analysed** | {', '.join(md_code(s) for s in services) if services else 'all'} |",
+        f"| **Services affected** | {affected} |",
         "",
         "---",
         "",
     ]
 
-    # ── Summary ────────────────────────────────────────────────────────────────
-    lines += ["## Summary", ""]
-    total_errors = len(result.by_severity.get('CRITICAL', [])) + \
-                   len(result.by_severity.get('ERROR', []))
-    total_events = len(result.timeline)
-
-    summary_parts = [
-        f"Analysis of **{result.total_raw} raw log entries** "
-        f"({total_events} unique events after deduplication) "
-        f"across **{len(result.by_service)} services**."
-    ]
+    # ── Summary
+    summary = [f"Analysis of **{result.total_raw:,} raw log entries** "
+               f"({len(result.timeline):,} unique events after deduplication) "
+               f"across **{len(result.by_service)} services**."]
     if result.first_anomaly:
-        summary_parts.append(
-            f"First anomaly detected at **{_ts(result.first_anomaly.timestamp)}** "
-            f"in **`{result.first_anomaly.service}`** "
-            f"({result.first_anomaly.severity})."
-        )
+        fa = result.first_anomaly
+        summary.append(f"First anomaly detected at **{_ts(fa.timestamp)}** in {md_code(fa.service)} ({fa.severity}).")
     if result.peak_window:
-        summary_parts.append(
-            f"Highest error density at **{result.peak_window.strftime('%H:%M')}**."
-        )
-    lines += [' '.join(summary_parts), "", "> *Auto-generated draft — review all sections before sharing.*", "", "---", ""]
+        summary.append(f"Highest error density at **{result.peak_window.strftime('%H:%M')}**.")
+    lines += ["## Summary", "", ' '.join(summary), "",
+              "> *Auto-generated draft — review all sections before sharing.*", "", "---", ""]
 
-    # ── Timeline ───────────────────────────────────────────────────────────────
+    # ── Timeline
     lines += ["## Timeline", ""]
-    show = [e for e in result.timeline if e.severity in ('CRITICAL', 'ERROR', 'WARNING')][:50]
+    show = _timeline_events(result)
     if show:
-        lines += [
-            "| Time | Service | Severity | Event |",
-            "|------|---------|----------|-------|",
-        ]
+        lines += ["| Time | Service | Severity | Event |", "|------|---------|----------|-------|"]
         for ev in show:
-            icon = _SEV_ICON.get(ev.severity, '')
-            svc = f"`{ev.service}`"
-            sev = f"{icon} {ev.severity}"
-            msg = _md_escape(ev.message[:100])
-            cnt = f" _(×{ev.count})_" if ev.count > 1 else ""
-            lines.append(f"| {_ts(ev.timestamp)} | {svc} | {sev} | {msg}{cnt} |")
-        if len([e for e in result.timeline if e.severity in ('CRITICAL', 'ERROR', 'WARNING')]) > 50:
-            lines.append(f"\n_Table truncated to 50 entries. Full list in error sections below._")
+            cnt = _repeat(ev)
+            lines.append(f"| {_ts(ev.timestamp)} | {md_code(ev.service)} | "
+                         f"{_SEV_ICON.get(ev.severity, '')} {ev.severity} | {md_text(ev.message, 140)}{cnt} |")
+        total = sum(1 for e in result.timeline if e.severity in ('CRITICAL', 'ERROR', 'WARNING'))
+        if total > len(show):
+            lines += ["", f"_Showing the {len(show)} most severe of {total} events. "
+                          "The full list is in the sections below._"]
     else:
         lines.append("_No warnings or errors found in the specified window._")
     lines += ["", "---", ""]
 
-    # ── Errors by severity ─────────────────────────────────────────────────────
+    # ── Events by severity
     lines += ["## Events by Severity", ""]
     for sev in _SEV_ORDER:
         evs = result.by_severity.get(sev, [])
         if not evs:
             continue
-        icon = _SEV_ICON.get(sev, '')
-        lines += [f"### {icon} {sev} ({len(evs)} event{'s' if len(evs) != 1 else ''})", ""]
+        lines += [f"### {_SEV_ICON.get(sev, '')} {sev} ({len(evs)} event{'s' if len(evs) != 1 else ''})", ""]
         for ev in evs[:30]:
-            cnt = f" _(×{ev.count})_" if ev.count > 1 else ""
-            patterns = ""
-            if ev.patterns:
-                patterns = " `[" + ", ".join(p.label for p in ev.patterns) + "]`"
-            lines.append(
-                f"- `[{_ts(ev.timestamp)}]` **{ev.service}** — "
-                f"{_md_escape(ev.message[:120])}{cnt}{patterns}"
-            )
+            cnt = _repeat(ev)
+            pats = f" `[{', '.join(p.label for p in ev.patterns)}]`" if ev.patterns else ""
+            lines.append(f"- `[{_ts(ev.timestamp)}]` {md_code(ev.service)} — {md_text(ev.message, 160)}{cnt}{pats}")
         if len(evs) > 30:
-            lines.append(f"\n_...and {len(evs) - 30} more {sev} events._")
+            lines += ["", f"_...and {len(evs) - 30} more {sev} events._"]
         lines.append("")
     lines += ["---", ""]
 
-    # ── Pattern summary ────────────────────────────────────────────────────────
+    # ── Pattern analysis
     if result.pattern_counts:
         lines += ["## Pattern Analysis", "",
                   "| Pattern | Occurrences | Affected services |",
                   "|---------|-------------|-------------------|"]
-        from .patterns import PATTERNS
-        pmap = {p.name: p for p in PATTERNS}
+        labels = {p.name: p.label for p in PATTERNS}
         for name, count in sorted(result.pattern_counts.items(), key=lambda x: -x[1]):
-            pat = pmap.get(name)
-            label = pat.label if pat else name
-            svcs = sorted({
-                e.service for e in result.timeline
-                if any(p.name == name for p in e.patterns)
-            })
-            svc_str = ', '.join(f'`{s}`' for s in svcs[:5])
-            if len(svcs) > 5:
-                svc_str += f' +{len(svcs)-5} more'
-            lines.append(f"| {label} | {count} | {svc_str} |")
+            svcs = sorted({e.service for e in result.timeline if any(p.name == name for p in e.patterns)})
+            svc_str = ', '.join(md_code(s) for s in svcs[:5]) + (f' +{len(svcs) - 5} more' if len(svcs) > 5 else '')
+            lines.append(f"| {labels.get(name, name)} | {count} | {svc_str} |")
         lines += ["", "---", ""]
 
-    # ── Contributing factors ───────────────────────────────────────────────────
-    lines += [
-        "## Contributing Factors",
-        "",
-        "> *Auto-detected from log patterns — verify each before including in final report.*",
-        "",
-    ]
-    for f in result.contributing_factors:
-        lines.append(f"- {f}")
+    # ── Contributing factors
+    lines += ["## Contributing Factors", "",
+              "> *Auto-detected from log patterns — verify each before including in final report.*", ""]
+    lines += [f"- {f}" for f in result.contributing_factors]
     lines += ["", "---", ""]
 
-    # ── Impact ─────────────────────────────────────────────────────────────────
+    # ── Manual sections
     lines += [
-        "## Impact Assessment",
-        "",
-        "<!-- Fill in manually -->",
-        "",
-        f"- **Affected services:** {affected_str}",
-        "- **Affected users:** ",
-        "- **Data loss:** ",
-        "- **Downtime:** ",
-        "- **Revenue impact:** ",
-        "",
-        "---",
-        "",
+        "## Impact Assessment", "", "<!-- Fill in manually -->", "",
+        f"- **Affected services:** {affected}",
+        "- **Affected users:** ", "- **Data loss:** ", "- **Downtime:** ", "- **Revenue impact:** ",
+        "", "---", "",
+        "## Root Cause Analysis", "", "<!-- Fill in manually after investigation -->", "",
+        "### What happened?", "", "### Why did it happen?", "", "### Why wasn't it caught earlier?", "",
+        "---", "",
+        "## Action Items", "",
     ]
-
-    # ── Root cause ─────────────────────────────────────────────────────────────
-    lines += [
-        "## Root Cause Analysis",
-        "",
-        "<!-- Fill in manually after investigation -->",
-        "",
-        "### What happened?",
-        "",
-        "### Why did it happen?",
-        "",
-        "### Why wasn't it caught earlier?",
-        "",
-        "---",
-        "",
-    ]
-
-    # ── Action items ───────────────────────────────────────────────────────────
-    lines += ["## Action Items", ""]
     if result.action_items:
-        lines.append("_Generated from detected patterns — assign owner and priority._")
-        lines.append("")
-        for item in result.action_items:
-            lines.append(f"- [ ] {item}")
+        lines += ["_Generated from detected patterns — assign owner and priority._", ""]
+        lines += [f"- [ ] {item}" for item in result.action_items]
     else:
         lines.append("- [ ] ")
-    lines += ["", "---", ""]
-
-    # ── Lessons learned ────────────────────────────────────────────────────────
     lines += [
-        "## Lessons Learned",
-        "",
-        "<!-- Fill in manually -->",
-        "",
-        "---",
-        "",
+        "", "---", "",
+        "## Lessons Learned", "", "<!-- Fill in manually -->", "", "---", "",
         f"*Generated by [syslog-postmortem](https://github.com/serber-info/syslog-postmortem) "
-        f"v{VERSION} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+        f"v{__version__} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
     ]
-
-    return '\n'.join(lines)
-
+    return '\n'.join(lines) + '\n'
 
 # ── HTML renderer ─────────────────────────────────────────────────────────────
 
-def render_html(md: str, title: str) -> str:
-    """Wrap Markdown in a minimal HTML shell with inline CSS."""
-    css = """
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-           max-width: 960px; margin: 40px auto; padding: 0 20px; color: #24292e; }
-    h1 { border-bottom: 2px solid #e1e4e8; padding-bottom: 12px; }
-    h2 { border-bottom: 1px solid #e1e4e8; padding-bottom: 8px; margin-top: 32px; }
-    table { border-collapse: collapse; width: 100%; margin: 16px 0; }
-    th { background: #f6f8fa; text-align: left; }
-    th, td { border: 1px solid #e1e4e8; padding: 8px 12px; font-size: 14px; }
-    tr:nth-child(even) { background: #f6f8fa; }
-    code { background: #f6f8fa; border-radius: 3px; padding: 2px 5px; font-size: 90%; }
-    blockquote { border-left: 4px solid #e1e4e8; margin: 0; padding: 8px 16px; color: #6a737d; }
-    pre { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto; }
-    li { margin: 4px 0; }
-    """
-    # Minimal Markdown → HTML (just enough for our output)
-    import re as _re
-    html = md
-    html = _re.sub(r'^# (.+)$', r'<h1>\1</h1>', html, flags=_re.M)
-    html = _re.sub(r'^## (.+)$', r'<h2>\1</h2>', html, flags=_re.M)
-    html = _re.sub(r'^### (.+)$', r'<h3>\1</h3>', html, flags=_re.M)
-    html = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html)
-    html = _re.sub(r'`(.+?)`', r'<code>\1</code>', html)
-    html = _re.sub(r'^- \[ \] (.+)$', r'<li>☐ \1</li>', html, flags=_re.M)
-    html = _re.sub(r'^- (.+)$', r'<li>\1</li>', html, flags=_re.M)
-    html = _re.sub(r'^---$', r'<hr>', html, flags=_re.M)
-    html = html.replace('\n', '<br>\n')
+_CSS = """
+    :root { color-scheme: light dark; --fg: #24292e; --bg: #fff; --muted: #6a737d; --line: #e1e4e8; --soft: #f6f8fa; }
+    @media (prefers-color-scheme: dark) {
+      :root { --fg: #e6edf3; --bg: #0d1117; --muted: #8b949e; --line: #30363d; --soft: #161b22; }
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.5;
+           max-width: 1000px; margin: 40px auto; padding: 0 20px; color: var(--fg); background: var(--bg); }
+    h1 { border-bottom: 2px solid var(--line); padding-bottom: 12px; }
+    h2 { border-bottom: 1px solid var(--line); padding-bottom: 8px; margin-top: 32px; }
+    table { border-collapse: collapse; width: 100%; margin: 16px 0; display: block; overflow-x: auto; }
+    th { background: var(--soft); text-align: left; }
+    th, td { border: 1px solid var(--line); padding: 6px 12px; font-size: 14px; vertical-align: top; }
+    tr:nth-child(even) td { background: var(--soft); }
+    code { background: var(--soft); border-radius: 3px; padding: 1px 5px; font-size: 90%; }
+    blockquote { border-left: 4px solid var(--line); margin: 0; padding: 4px 16px; color: var(--muted); }
+    hr { border: 0; border-top: 1px solid var(--line); margin: 24px 0; }
+    ul { padding-left: 24px; } li { margin: 4px 0; } li.task { list-style: none; margin-left: -20px; }
+"""
 
+_INLINE = [
+    (re.compile(r'(?<!\\)`(.+?)(?<!\\)`'), r'<code>\1</code>'),
+    (re.compile(r'(?<!\\)\*\*(.+?)(?<!\\)\*\*'), r'<strong>\1</strong>'),
+    (re.compile(r'(?<![\\\w])\*(.+?)(?<!\\)\*(?!\w)'), r'<em>\1</em>'),
+    (re.compile(r'(?<![\\\w])_(.+?)(?<!\\)_(?!\w)'), r'<em>\1</em>'),
+    (re.compile(r'\[([^\]]+)\]\((https?://[^)\s]+)\)'), r'<a href="\2">\1</a>'),
+]
+_UNESCAPE = re.compile(r'\\([\\`*_\[\]|#~]|&lt;|&gt;)')
+
+
+def _inline(text: str) -> str:
+    """Escape first, then apply inline Markdown, then drop backslash escapes."""
+    out = html.escape(text, quote=False)
+    for regex, repl in _INLINE:
+        out = regex.sub(repl, out)
+    return _UNESCAPE.sub(r'\1', out)
+
+
+def _cells(row: str) -> List[str]:
+    return [c.strip() for c in re.split(r'(?<!\\)\|', row.strip().strip('|'))]
+
+
+def markdown_to_html(md: str) -> str:
+    """Convert the Markdown subset produced by render_markdown into safe HTML."""
+    out: List[str] = []
+    lines = md.split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.fullmatch(r'<!--[^<>]*-->', line):          # our own "fill in" hints
+            out.append(line)
+        elif line.startswith('#'):
+            level = len(line) - len(line.lstrip('#'))
+            out.append(f"<h{level}>{_inline(line[level:].strip())}</h{level}>")
+        elif line == '---':
+            out.append('<hr>')
+        elif line.startswith('> '):
+            out.append(f"<blockquote>{_inline(line[2:])}</blockquote>")
+        elif line.startswith('|'):
+            rows = []
+            while i < len(lines) and lines[i].startswith('|'):
+                rows.append(lines[i])
+                i += 1
+            header, body = _cells(rows[0]), [r for r in rows[1:] if not re.fullmatch(r'[|\s:-]+', r)]
+            table = ['<table>', '<thead><tr>' + ''.join(f'<th>{_inline(c)}</th>' for c in header) + '</tr></thead>',
+                     '<tbody>']
+            table += ['<tr>' + ''.join(f'<td>{_inline(c)}</td>' for c in _cells(r)) + '</tr>' for r in body]
+            out += table + ['</tbody>', '</table>']
+            continue
+        elif line.startswith('- '):
+            items = []
+            while i < len(lines) and lines[i].startswith('- '):
+                item = lines[i][2:]
+                if item.startswith('[ ] '):
+                    items.append(f'<li class="task">☐ {_inline(item[4:])}</li>')
+                else:
+                    items.append(f'<li>{_inline(item)}</li>')
+                i += 1
+            out += ['<ul>'] + items + ['</ul>']
+            continue
+        elif line.strip():
+            out.append(f"<p>{_inline(line)}</p>")
+        i += 1
+    return '\n'.join(out)
+
+
+def render_html(md: str, title: str) -> str:
+    """Standalone HTML page (inline CSS, light/dark) for the Markdown report."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{title}</title>
-  <style>{css}</style>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+  <title>Postmortem: {html.escape(title)}</title>
+  <style>{_CSS}</style>
 </head>
 <body>
-{html}
+{markdown_to_html(md)}
 </body>
 </html>
 """
