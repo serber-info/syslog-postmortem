@@ -10,6 +10,10 @@ timelines by hand at 3 a.m.
 Reads `journalctl` plus `/var/log/syslog`, `messages`, `auth.log`, `secure` and `kern.log`, correlates
 events, detects known failure patterns and writes a ready-to-edit Markdown or HTML postmortem.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/serber-info/syslog-postmortem/main/docs/demo.gif" alt="postmortem demo: incident analysis with cascading failure and action items" width="820">
+</p>
+
 ---
 
 ## ✨ What it does
